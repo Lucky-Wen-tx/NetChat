@@ -1,0 +1,80 @@
+# ==============================================================================
+# NetChat 容器编排文件
+#
+# 使用方式：
+#   1. 构建并后台启动服务端：
+#        docker compose up -d --build server
+#        （可选）指定聊天室名称：$env:CHAT_NAME="摸鱼小组"; docker compose up -d server
+#   2. 查看服务端日志：
+#        docker compose logs -f server
+#   3. 进入客户端聊天（-it 交互，退出后容器自动删除）：
+#        docker compose run --rm --no-deps client
+#   4. 全部停止并清理：
+#        docker compose down
+#
+# 注：Compose V2 已废弃顶层 version: 字段，写与不写效果相同，故省略。
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 服务端：TCP 监听容器内 8080
+  # ----------------------------------------------------------------------------
+  server:
+    build:
+      context: .              # 构建上下文为项目根目录（需要 cmd/ internal/ pkg/ go.mod）
+      target: server          # 指定使用 Dockerfile 中的 server 阶段
+    image: netchat-server:latest
+    container_name: netchat-server
+
+    environment:
+      # 聊天室名称。这里【故意不写默认值】，${CHAT_NAME:-} 表示未设置时传一个空串，
+      # 由 cmd/server/main.go 里的 defaultChatName 兜底。
+      # 好处：改默认名字只需改 Go 代码，compose 文件保持稳定，
+      # 不会产生配置漂移导致容器被意外重建。
+      # 启动时指定：$env:CHAT_NAME="摸鱼小组"; docker compose up -d server
+      - CHAT_NAME=${CHAT_NAME:-}
+
+    # 按需求不映射端口到宿主机。
+    # 说明：Dockerfile 里的 EXPOSE 8080 只是文档声明，不会发布端口；
+    # 而同网络内的客户端容器访问 server:8080 也完全不依赖端口映射，
+    # 因此宿主机当前无法直连服务端（如需本地 go run 客户端调试，再补 ports 即可）。
+
+    restart: "no"             # 学习环境不做自动重启，避免出错时反复重启刷日志
+
+    networks:
+      - netchat
+
+  # ----------------------------------------------------------------------------
+  # 客户端：交互式程序，靠环境变量拿到服务端地址
+  # ----------------------------------------------------------------------------
+  client:
+    build:
+      context: .
+      target: client
+    image: netchat-client:latest
+    container_name: netchat-client
+
+    # depends_on 只保证「启动顺序」：先起 server 容器，再起 client 容器。
+    # 它不等待服务端真正 listen 就绪，因此首次连接有小概率报「连接服务器失败」，
+    # 重试一次即可（本项目服务端毫秒级启动，实测基本不会触发）。
+    depends_on:
+      - server
+
+    environment:
+      # 关键：server 是上面的服务名，Compose 内置 DNS 会把它解析成服务端容器 IP。
+      # 不能用 127.0.0.1——那在客户端容器内部指的是它自己。
+      - SERVER_ADDR=server:8080
+
+    # 注意：这里绝对不能加 restart 策略。
+    # 客户端的正常生命周期就是「聊天结束即退出」，加了 restart 会变成
+    # 退出→重启→再退出 的死循环，并反复冲击服务端。
+    restart: "no"
+
+    networks:
+      - netchat
+
+networks:
+  # Compose 默认就会创建 bridge 网络并提供服务名 DNS 解析，
+  # 这里显式声明只是为了让配置自解释，非必需。
+  netchat:
+    driver: bridge
