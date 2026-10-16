@@ -4,9 +4,21 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
+	"time"
 
 	"netChat/pkg/utils"
+)
+
+const (
+	// keepAlivePeriod TCP 保活探测周期。
+	// 客户端断电、休眠或 NAT 超时留下的僵死连接靠内核探活回收，
+	// 否则它会一直留在 clients 里：虚增在线人数，还被算作广播目标。
+	keepAlivePeriod = 30 * time.Second
+
+	// shutdownDrainTimeout 关服时等待各客户端发送队列排空的上限
+	shutdownDrainTimeout = 500 * time.Millisecond
 )
 
 type ChatServer struct {
@@ -22,27 +34,18 @@ func NewChatServer(name string) *ChatServer {
 	}
 }
 
-// broadcastSystem 广播系统消息
-func (s *ChatServer) broadcastSystem(content string) {
-	msg, _ := utils.MsgSystem(content, s.name)
-
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-	for _, c := range s.clients {
-		c.send <- msg
-	}
-}
-
-// broadcastUser 广播用户消息，排除发送者本人
-func (s *ChatServer) broadcastUser(sender string, msg string) {
+// broadcast 向在线客户端推送消息，except 指定要跳过的昵称（空串表示全员都发）。
+//
+// 注意本函数持有读锁，因此遍历过程中的每一个写动作都必须是非阻塞的（见 ClientConn.enqueue）。
+func (s *ChatServer) broadcast(msg string, except string) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
 	for name, c := range s.clients {
-		if name == sender {
+		if name == except {
 			continue
 		}
-		c.send <- msg
+		c.enqueue(msg)
 	}
 }
 
@@ -71,39 +74,103 @@ func (s *ChatServer) OnlineCount() int {
 	return len(s.clients)
 }
 
+// pendingSends 统计所有客户端待发送队列里还剩多少条消息
+func (s *ChatServer) pendingSends() int {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	n := 0
+	for _, c := range s.clients {
+		n += len(c.send)
+	}
+	return n
+}
+
+// rejectLogin 给登录失败的连接回一条 error 消息再关闭。
+// 有了这条回执，客户端才能在 Login 阶段就明确失败，
+// 而不是写成功就当自己进去了，随后才收到一句莫名其妙的错误。
+func (s *ChatServer) rejectLogin(conn net.Conn, reason string) {
+	fmt.Fprintln(conn, utils.MsgError(reason, s.name))
+	conn.Close()
+}
+
 // HandleConn 处理新接入的客户端连接
 func (s *ChatServer) HandleConn(conn net.Conn) {
 	clientAddr := conn.RemoteAddr().String()
 	fmt.Printf("新连接接入：%s\n", clientAddr)
 
-	// 使用昵称完成登录，并校验通过
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		conn.Close()
-		fmt.Printf("连接[%s]未发送昵称，登录失败连接断开\n", clientAddr)
-		return
+	// 内核级保活，不改变应用层协议
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(keepAlivePeriod)
 	}
 
-	nickname := scanner.Text()
+	// 这条连接自始至终只用这一个 Scanner，原因见 ClientConn.reader 的注释
+	reader := bufio.NewScanner(conn)
 
-	client := newClientConn(conn, nickname, s)
-	if err := s.addClient(client); err != nil {
-		tip := fmt.Sprintf("%v",err)
-		msg, err := utils.MsgSystem(tip, s.name)
-		if err != nil {
-			fmt.Printf("序列化消息失败，系统: %v\n", err)
+	// 首行必须是昵称
+	if !reader.Scan() {
+		if err := reader.Err(); err != nil {
+			fmt.Printf("读取连接[%s]昵称失败：%v\n", clientAddr, err)
+		} else {
+			fmt.Printf("连接[%s]未发送昵称，登录失败连接断开\n", clientAddr)
 		}
-		fmt.Fprintln(conn, msg)
 		conn.Close()
-		fmt.Printf("连接[%s] 昵称冲突: %s\n", clientAddr, nickname)
 		return
 	}
+
+	// 昵称必须由服务端自己校验：客户端那侧只是提前提示，绕开它是零成本的
+	nickname := strings.TrimSpace(reader.Text())
+	if err := utils.VerifyName(nickname); err != nil {
+		s.rejectLogin(conn, fmt.Sprintf("昵称不合法：%v", err))
+		fmt.Printf("连接[%s] 昵称[%s]不合法，已拒绝\n", clientAddr, nickname)
+		return
+	}
+
+	client := newClientConn(conn, reader, nickname, s)
+	if err := s.addClient(client); err != nil {
+		s.rejectLogin(conn, fmt.Sprintf("%v", err))
+		fmt.Printf("连接[%s] 昵称冲突：%s\n", clientAddr, nickname)
+		return
+	}
+
+	// 登录回执。此刻 writeLoop 还没启动，直接写不会出现第二个写者。
+	fmt.Fprintln(conn, utils.MsgSystem(fmt.Sprintf(
+		"欢迎你，%s！当前在线 %d 人。", nickname, s.OnlineCount()), s.name))
 
 	// 启动该客户端专属读写协程
 	go client.writeLoop()
 	go client.readLoop()
 
-	// 系统广播上线通知
-	s.broadcastSystem(fmt.Sprintf("用户[%s] 加入本聊天室[%s]，当前在线人数%d人", nickname, s.name, s.OnlineCount()))
+	// 系统广播上线通知（不含本人，本人已经在欢迎语里知道在线人数了）
+	s.broadcast(utils.MsgSystem(fmt.Sprintf(
+		"用户[%s] 加入本聊天室[%s]，当前在线人数%d人", nickname, s.name, s.OnlineCount()), s.name), nickname)
 	fmt.Printf("用户[%s] 上线，地址：%s\n", nickname, clientAddr)
+}
+
+// Shutdown 广播关闭通知并断开所有客户端连接。
+//
+// 通知是尽力而为的：先投递，再等各客户端的发送队列排空（队列排空只说明
+// 数据已交给写协程，所以再留一点余量让它们真正写进 TCP 缓冲），最后才断连接。
+// 不等就直接 Close 的话，队列里的通知会被丢掉，客户端只会看到连接莫名其妙断了。
+// 要做到严格可靠，需要每个 writeLoop 显式回一个"已写出"的信号，这里没这必要。
+func (s *ChatServer) Shutdown(reason string) {
+	s.broadcast(utils.MsgSystem(reason, s.name), "")
+
+	deadline := time.Now().Add(shutdownDrainTimeout)
+	for time.Now().Before(deadline) && s.pendingSends() > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	s.lock.RLock()
+	conns := make([]net.Conn, 0, len(s.clients))
+	for _, c := range s.clients {
+		conns = append(conns, c.Conn)
+	}
+	s.lock.RUnlock()
+
+	for _, conn := range conns {
+		conn.Close()
+	}
 }
