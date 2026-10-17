@@ -21,14 +21,14 @@ FROM golang:1.26.5-alpine AS builder
 WORKDIR /build
 
 # 先只拷贝依赖清单，再执行下载。
-# 目的：利用 Docker 的分层缓存——只要 go.mod 不变，这一层就命中缓存，
+# 目的：利用 Docker 的分层缓存——只要 go.mod / go.sum 不变，这一层就命中缓存，
 # 后续改源码不会触发依赖重新下载。
-# 注意：本项目没有 go.sum（无第三方依赖），所以这里不能写 "COPY go.mod go.sum ./"，
-# 那样会因找不到 go.sum 而直接构建失败。
-COPY go.mod ./
+COPY go.mod go.sum ./
 
-# 当前项目纯标准库，该命令实际不下载任何东西；
-# 保留此结构是为了将来引入第三方依赖时自动获得缓存收益。
+# 设置 Go 模块代理为国内镜像，direct 表示如果代理失败则尝试直接连接源仓库
+ENV GOPROXY=https://goproxy.cn,direct
+
+# 下载 go.mod 中声明的依赖（mysql 驱动、bcrypt 等）。
 RUN go mod download
 
 # 再拷贝源码。源码是频繁改动的，必须放在依赖层之后，否则每次改代码都要重下依赖。

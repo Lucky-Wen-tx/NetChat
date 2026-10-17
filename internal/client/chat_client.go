@@ -78,8 +78,32 @@ func (c *ChatClient) Login() error {
 		break
 	}
 
-	// 第一条消息发送昵称，完成服务端登录
+	// 密码只用于本次登录，不保存到 ChatClient 字段里。
+	// 继续复用同一个 input Scanner，具体原因同昵称输入。
+	fmt.Print("【系统】请输入密码（首次登录将自动注册）：")
+	var password string
+	for {
+		if !c.input.Scan() {
+			if err := c.input.Err(); err != nil {
+				return fmt.Errorf("读取控制台输入失败: %v", err)
+			}
+			return fmt.Errorf("输入终止")
+		}
+		password = c.input.Text()
+		if err := utils.VerifyPassword(password); err != nil {
+			fmt.Printf("【警告】密码格式不合法: %v\n", err)
+			fmt.Print("【系统】请重新输入密码：")
+			continue
+		}
+		break
+	}
+
+	// 登录协议：第一行昵称、第二行密码，都是裸文本。
+	// 密码按用户输入原样发送，不做 TrimSpace。
 	if _, err := fmt.Fprintln(c.conn, c.name); err != nil {
+		return fmt.Errorf("登录失败: %v", err)
+	}
+	if _, err := fmt.Fprintln(c.conn, password); err != nil {
 		return fmt.Errorf("登录失败: %v", err)
 	}
 

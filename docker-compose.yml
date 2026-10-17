@@ -2,19 +2,57 @@
 # NetChat 容器编排文件
 #
 # 使用方式：
-#   1. 构建并后台启动服务端：
-#        docker compose up -d --build server
-#        （可选）指定聊天室名称：$env:CHAT_NAME="摸鱼小组"; docker compose up -d server
+#   0. 首次运行先准备数据库密码：
+#        cp .env.example .env    # 然后修改 .env 中的密码
+#   1. 构建并后台启动 MySQL 与服务端（server 会等 MySQL 健康后再启动）：
+#        docker compose up -d --build mysql server
+#        （可选）指定聊天室名称：$env:CHAT_NAME="摸鱼小组"; docker compose up -d mysql server
 #   2. 查看服务端日志：
 #        docker compose logs -f server
 #   3. 进入客户端聊天（-it 交互，退出后容器自动删除）：
 #        docker compose run --rm --no-deps client
-#   4. 全部停止并清理：
+#   4. 全部停止并清理（数据卷保留；加 -v 才会清空数据库）：
 #        docker compose down
 #
 # ==============================================================================
 
 services:
+  # ----------------------------------------------------------------------------
+  # MySQL：用户账号持久化
+  # ----------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.4
+    container_name: netchat-mysql
+
+    environment:
+      # 密码必须写在 .env 里（该文件已被 .gitignore / .dockerignore 排除），
+      # 没设置时 compose 会直接报错，避免悄悄用默认密码启动。
+      # 密码建议只用字母数字：它会被原样拼进下面的 MYSQL_DSN。
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-netchat}"
+      MYSQL_USER: "${MYSQL_USER:-netchat}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}"
+
+    volumes:
+      # 命名卷：docker compose down 后数据仍在，只有 down -v 才清空
+      - mysql-data:/var/lib/mysql
+
+    healthcheck:
+      # 用 127.0.0.1 强制走 TCP：初始化阶段的临时实例只开 socket，
+      # 用 localhost 会被过早判为健康。
+      # 不带密码：mysqladmin ping 在「服务已启动但拒绝连接」时同样返回 0，
+      # 足以表示就绪，同时避免密码出现在容器进程参数里。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+    restart: "no"
+
+    networks:
+      - netchat
+
   # ----------------------------------------------------------------------------
   # 服务端：TCP 监听容器内 8080
   # ----------------------------------------------------------------------------
@@ -32,6 +70,16 @@ services:
       # 不会产生配置漂移导致容器被意外重建。
       # 启动时指定：$env:CHAT_NAME="摸鱼小组"; docker compose up -d server
       - CHAT_NAME=${CHAT_NAME:-}
+      # 数据库连接串。compose 在宿主机侧完成变量插值后传给容器，
+      # 服务端代码只认这个环境变量，不保留任何默认密码。
+      # 密码含 @ : / ? & 等字符会破坏 DSN 解析，.env.example 建议只用字母数字。
+      - "MYSQL_DSN=${MYSQL_USER:-netchat}:${MYSQL_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-netchat}?parseTime=true&charset=utf8mb4"
+
+    # 等 MySQL 健康检查通过再启动，避免启动时数据库还没准备好。
+    # 服务端内部还有一层 Ping 重试，双保险。
+    depends_on:
+      mysql:
+        condition: service_healthy
 
     # 按需求不映射端口到宿主机。
     # 说明：Dockerfile 里的 EXPOSE 8080 只是文档声明，不会发布端口；
@@ -77,3 +125,8 @@ networks:
   # 这里显式声明只是为了让配置自解释，非必需。
   netchat:
     driver: bridge
+
+volumes:
+  # MySQL 数据目录。命名卷由 Docker 管理，容器删除后数据仍在；
+  # docker compose down 不会删除它，down -v 才会。
+  mysql-data:

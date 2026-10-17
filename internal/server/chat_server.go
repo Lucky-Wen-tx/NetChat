@@ -2,12 +2,15 @@ package server
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"netChat/internal/store"
 	"netChat/pkg/utils"
 )
 
@@ -19,17 +22,23 @@ const (
 
 	// shutdownDrainTimeout 关服时等待各客户端发送队列排空的上限
 	shutdownDrainTimeout = 500 * time.Millisecond
+
+	// authenticateTimeout 单次登录认证访问数据库的超时。
+	// 必须设上限：数据库卡住时不能把登录协程一直挂着。
+	authenticateTimeout = 5 * time.Second
 )
 
 type ChatServer struct {
 	name    string
+	store   *store.Store
 	clients map[string]*ClientConn
 	lock    sync.RWMutex
 }
 
-func NewChatServer(name string) *ChatServer {
+func NewChatServer(name string, st *store.Store) *ChatServer {
 	return &ChatServer{
 		name:    name,
+		store:   st,
 		clients: make(map[string]*ClientConn),
 	}
 }
@@ -125,6 +134,42 @@ func (s *ChatServer) HandleConn(conn net.Conn) {
 		s.rejectLogin(conn, fmt.Sprintf("昵称不合法：%v", err))
 		fmt.Printf("连接[%s] 昵称[%s]不合法，已拒绝\n", clientAddr, nickname)
 		return
+	}
+
+	// 第二行是密码。必须复用上面这个 reader（Scanner 会预读，换掉会丢数据）。
+	// 密码不做 TrimSpace：注册和登录都必须按用户输入的原文处理。
+	if !reader.Scan() {
+		if err := reader.Err(); err != nil {
+			fmt.Printf("读取连接[%s]密码失败：%v\n", clientAddr, err)
+		} else {
+			fmt.Printf("连接[%s]未发送密码，登录失败连接断开\n", clientAddr)
+		}
+		conn.Close()
+		return
+	}
+	password := reader.Text()
+	if err := utils.VerifyPassword(password); err != nil {
+		s.rejectLogin(conn, fmt.Sprintf("密码不合法：%v", err))
+		fmt.Printf("连接[%s] 用户[%s]密码不合法，已拒绝\n", clientAddr, nickname)
+		return
+	}
+
+	authCtx, cancel := context.WithTimeout(context.Background(), authenticateTimeout)
+	created, err := s.store.Authenticate(authCtx, nickname, password)
+	cancel()
+	switch {
+	case errors.Is(err, store.ErrInvalidPassword):
+		s.rejectLogin(conn, "用户名或密码错误")
+		fmt.Printf("连接[%s] 用户[%s]密码错误，已拒绝\n", clientAddr, nickname)
+		return
+	case err != nil:
+		// 只记录用户名和错误本身，绝不记录密码
+		fmt.Printf("连接[%s] 用户[%s]认证失败（数据库错误）：%v\n", clientAddr, nickname, err)
+		s.rejectLogin(conn, "服务器暂时无法验证登录，请稍后再试")
+		return
+	}
+	if created {
+		fmt.Printf("新用户[%s] 已自动注册\n", nickname)
 	}
 
 	client := newClientConn(conn, reader, nickname, s)

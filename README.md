@@ -1,15 +1,16 @@
 # NetChat
 
-一个纯标准库（无第三方依赖）实现的 TCP 聊天室：服务端 + 命令行客户端，
-消息用结构化 JSON 承载，带 Docker 双 target 镜像。
+一个 Go 实现的 TCP 聊天室：服务端 + 命令行客户端，消息用结构化 JSON 承载。
+用户名和密码通过 MySQL 持久化，密码只存 bcrypt 哈希，带 Docker 双 target 镜像。
 
 ```
 cmd/server        服务端入口（监听 :8080 / CHAT_NAME 指定聊天室名）
 cmd/client        客户端入口（SERVER_ADDR 指定服务端地址）
 internal/model    消息与用户对象
-internal/server   服务端：连接管理、广播、读写协程
+internal/server   服务端：连接管理、登录认证、广播、读写协程
 internal/client   客户端：登录、收发、退出
-pkg/utils         协议打包/解析、昵称校验、控制台格式化
+internal/store    用户账号持久化（MySQL）
+pkg/utils         协议打包/解析、昵称与密码校验、控制台格式化
 ```
 
 ## 通信协议
@@ -18,7 +19,10 @@ pkg/utils         协议打包/解析、昵称校验、控制台格式化
 
 ### 1. 握手
 
-1. 客户端连上后，**第一行必须是昵称**，纯文本，不是 JSON。
+1. 客户端连上后依次发送**两行裸文本**（不是 JSON）：
+   - 第 1 行：昵称
+   - 第 2 行：密码
+
 2. 服务端校验昵称：
 
    | 规则 | 说明 |
@@ -27,6 +31,12 @@ pkg/utils         协议打包/解析、昵称校验、控制台格式化
    | 无空白字符 | 含空格、制表符 |
    | 无控制字符 | 含 ANSI 转义序列——昵称会被打印进别人的终端，不拦就能操控它 |
    | 不与他人重名 | 房间内昵称唯一 |
+
+   密码规则：至少 6 个字符、不超过 72 字节（bcrypt 上限）、无空白/控制字符；
+   密码按原样处理，不做 trim。
+
+   账号行为：用户名不存在时**首次登录自动注册**（存 bcrypt 哈希），
+   已存在时校验密码，不匹配则拒绝登录。
 
 3. 服务端回**恰好一条**报文：
 
@@ -62,11 +72,17 @@ pkg/utils         协议打包/解析、昵称校验、控制台格式化
 
 ## 运行
 
-本地：
+本地（需要先有一个可用的 MySQL）：
 
 ```bash
-go run ./cmd/server                      # 默认聊天室名「摸鱼小组」
-CHAT_NAME=技术交流 go run ./cmd/server    # 指定聊天室名
+# 服务端必须提供 MYSQL_DSN，否则启动失败
+MYSQL_DSN='netchat:password@tcp(127.0.0.1:3306)/netchat?parseTime=true&charset=utf8mb4' \
+  go run ./cmd/server
+
+CHAT_NAME=技术交流 \
+MYSQL_DSN='netchat:password@tcp(127.0.0.1:3306)/netchat?parseTime=true&charset=utf8mb4' \
+  go run ./cmd/server
+
 go run ./cmd/client                      # 另开终端，默认连 127.0.0.1:8080
 SERVER_ADDR=127.0.0.1:8080 go run ./cmd/client
 ```
@@ -74,11 +90,16 @@ SERVER_ADDR=127.0.0.1:8080 go run ./cmd/client
 Docker / Compose：
 
 ```bash
-docker compose up -d --build server       # 起服务端（容器内监听 8080）
+cp .env.example .env                      # 首次运行：复制并修改数据库密码
+docker compose up -d --build mysql server # 起 MySQL + 服务端（等 MySQL 健康后 server 才启动）
 docker compose logs -f server
 docker compose run --rm --no-deps client  # 进客户端聊天，退出即删容器
-docker compose down
+docker compose down                       # 停止，数据库数据保留在命名卷中
+docker compose down -v                    # 连数据库数据一起删除
 ```
+
+`users` 表由服务端启动时自动 `CREATE TABLE IF NOT EXISTS`，无需手动执行 SQL。
+数据保存在 `mysql-data` 命名卷中：普通 `down` 不会丢，`down -v` 才会清空。
 
 按当前 compose 配置，服务端**没有**把端口映射到宿主机，
 所以宿主机上的 `go run ./cmd/client` 连不上容器里的服务端；
