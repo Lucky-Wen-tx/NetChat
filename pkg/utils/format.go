@@ -11,9 +11,7 @@ import (
 	"netChat/internal/model"
 )
 
-// MaxContentLen 单条聊天消息允许的最大长度（字符数）。
-// 协议本身是「一行一条消息」，bufio.Scanner 还有 64KB 的硬上限兜底，
-// 这里再加一道业务限制，避免一条消息就能把别的客户端刷屏。
+// MaxContentLen 单条消息最大长度（字符数）。bufio.Scanner 还有 64KB 硬上限兜底，这里再加一道业务限制。
 const MaxContentLen = 2000
 
 // FormatPrintln 按消息类型格式化输出到客户端控制台
@@ -33,12 +31,8 @@ func FormatPrintln(msg *model.Message) {
 	}
 }
 
-// ParseUserMsg 解析并校验客户端发来的一行聊天消息。
-//
-// 服务端只从里面取 Content：Type 必须显式等于 user，
-// From 一律丢弃（由服务端按这条连接登录时的昵称重填）。
-// 否则客户端可以自己拼一个 type=system 的报文冒充服务端发系统广播，
-// 或者把 from 填成别人的昵称冒名发言。
+// ParseUserMsg 解析客户端报文。服务端只取 Content：Type 必须显式是 user，
+// From 一律丢弃（由服务端按登录昵称重填），否则客户端能伪造 system 广播或冒用他人昵称。
 func ParseUserMsg(line string) (*model.Message, error) {
 	var msg model.Message
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
@@ -59,11 +53,8 @@ func ParseUserMsg(line string) (*model.Message, error) {
 	return &msg, nil
 }
 
-// MsgSystem 打包服务端系统消息，from 传聊天室名字。
-//
-// 这几个 Msg* 打包函数只返回 string、不返回 error：
-// Message 的字段全是可序列化类型，json.Marshal 对它不可能失败。
-// 将来若给 Message 加上 channel、func 之类的字段，这里要重新考虑。
+// MsgSystem 打包服务端系统消息。这几个 Msg* 函数只返回 string 不返回 error：
+// Message 字段全是可序列化类型，json.Marshal 不可能失败。
 func MsgSystem(content string, from string) string {
 	return mustMarshal(model.Message{
 		Type:      model.MsgTypeSystem,
@@ -93,6 +84,8 @@ func MsgError(content string, from string) string {
 	})
 }
 
+// mustMarshal 理论上不可达（见 MsgSystem 注释）。真出现了也不能发半截报文，
+// 宁可发一条明确的系统提示。
 func mustMarshal(msg model.Message) string {
 	data, err := json.Marshal(msg)
 	if err != nil {

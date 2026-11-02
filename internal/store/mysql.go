@@ -1,7 +1,5 @@
-// Package store 负责用户账号的 MySQL 持久化。
-//
-// 只做两件事：建表、按用户名认证（不存在则自动注册）。
-// 不引入 ORM、迁移框架或 repository 接口，保持与项目其余部分一致的轻量风格。
+// Package store 负责用户账号的 MySQL 持久化：建表、认证（不存在则自动注册）。
+// 不引入 ORM 或迁移框架，保持与项目其余部分一致的轻量风格。
 package store
 
 import (
@@ -15,8 +13,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// ErrInvalidPassword 用户已存在，但密码不匹配。
-// 调用方据此给客户端返回统一的「用户名或密码错误」，不暴露账号是否存在。
+// ErrInvalidPassword 用户已存在但密码不匹配。调用方据此返回统一的「用户名或密码错误」，不暴露账号是否存在。
 var ErrInvalidPassword = errors.New("用户名或密码错误")
 
 // mysqlDuplicateEntry 是 MySQL 唯一键冲突（Duplicate entry）的错误码。
@@ -27,10 +24,8 @@ type Store struct {
 	db *sql.DB
 }
 
-// Open 建立 MySQL 连接池，并在 ctx 超时前反复 Ping，直到数据库可用。
-//
-// compose 里已经用 healthcheck 保证启动顺序，这里再留一层重试，
-// 覆盖本地直接运行、以及数据库刚就绪时短暂拒绝连接的抖动。
+// Open 建立 MySQL 连接池并反复 Ping 直到数据库可用。
+// compose 已有 healthcheck 保证启动顺序，这里再留一层重试覆盖本地直接运行的场景。
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -78,9 +73,7 @@ CREATE TABLE IF NOT EXISTS users (
 }
 
 // Authenticate 校验用户名和密码；用户不存在时自动注册。
-//
-// created 表示本次调用是否新建了账号，仅用于日志提示。
-// 密码错误返回 ErrInvalidPassword；数据库故障返回包装后的其他错误。
+// created 表示本次是否新建了账号，仅用于日志提示。密码错误返回 ErrInvalidPassword。
 func (s *Store) Authenticate(ctx context.Context, username, password string) (created bool, err error) {
 	var hash string
 	err = s.db.QueryRowContext(ctx,
@@ -134,8 +127,7 @@ func (s *Store) verifyExisting(ctx context.Context, username, password string) e
 	return nil
 }
 
-// isDuplicateEntry 判断是否为唯一键冲突。
-// 用驱动提供的错误码，而不是比对错误文案，避免受 MySQL 语言/版本影响。
+// isDuplicateEntry 用驱动错误码判断唯一键冲突，不比对错误文案，避免受 MySQL 语言/版本影响。
 func isDuplicateEntry(err error) bool {
 	var me *mysql.MySQLError
 	return errors.As(err, &me) && me.Number == mysqlDuplicateEntry
@@ -144,4 +136,15 @@ func isDuplicateEntry(err error) bool {
 // Close 关闭连接池
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// GetHash 查询指定用户的密码哈希，供 Redis 缓存层回写缓存使用。
+func (s *Store) GetHash(ctx context.Context, username string) (string, error) {
+	var hash string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT password_hash FROM users WHERE username = ?`, username).Scan(&hash)
+	if err != nil {
+		return "", fmt.Errorf("查询用户哈希失败: %w", err)
+	}
+	return hash, nil
 }
