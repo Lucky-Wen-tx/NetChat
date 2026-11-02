@@ -21,12 +21,10 @@ type ChatClient struct {
 	quit chan struct{} // 退出信号：任意一侧收尾时关闭
 
 	// input 是控制台输入的唯一读取器，Login 与 inputLoop 共用。
-	// 不能各建一个：bufio.Scanner 会预读最多 4096 字节，
-	// 新建 Scanner 等于把已预读进内存、还没消费的输入（比如粘贴进来的多行）一起丢掉。
+	// bufio.Scanner 会预读最多 4096 字节，新建 Scanner 会丢掉已预读的数据。
 	input *bufio.Scanner
 
-	// reader 同理，是服务端连接的唯一行读取器，Login 读登录回执、
-	// acceptLoop 收消息都走它，中途绝不能重建。
+	// reader 同理，是服务端连接的唯一行读取器，中途绝不能重建。
 	reader *bufio.Scanner
 
 	stopOnce sync.Once
@@ -78,8 +76,7 @@ func (c *ChatClient) Login() error {
 		break
 	}
 
-	// 密码只用于本次登录，不保存到 ChatClient 字段里。
-	// 继续复用同一个 input Scanner，具体原因同昵称输入。
+	// 密码只用于本次登录，不保存到 ChatClient 字段里。继续复用同一个 input Scanner。
 	fmt.Print("【系统】请输入密码（首次登录将自动注册）：")
 	var password string
 	for {
@@ -98,8 +95,7 @@ func (c *ChatClient) Login() error {
 		break
 	}
 
-	// 登录协议：第一行昵称、第二行密码，都是裸文本。
-	// 密码按用户输入原样发送，不做 TrimSpace。
+	// 登录协议：第一行昵称、第二行密码，都是裸文本。密码按原文发送，不做 TrimSpace。
 	if _, err := fmt.Fprintln(c.conn, c.name); err != nil {
 		return fmt.Errorf("登录失败: %v", err)
 	}
@@ -107,9 +103,8 @@ func (c *ChatClient) Login() error {
 		return fmt.Errorf("登录失败: %v", err)
 	}
 
-	// 必须等服务端回执才算登录成功。
-	// 昵称冲突时服务端只回一条 error 就断开，绝不能凭「写成功」就宣布进入聊天室，
-	// 否则用户会先看到「正在进入聊天室」，紧接着才收到失败提示。
+	// 必须等服务端回执才算登录成功。昵称冲突时服务端只回 error 就断开，
+	// 绝不能凭「写成功」就宣布进入聊天室。
 	if !c.reader.Scan() {
 		if err := c.reader.Err(); err != nil {
 			return fmt.Errorf("等待服务端响应失败: %v", err)
@@ -181,9 +176,17 @@ func (c *ChatClient) inputLoop() {
 		if content == "" {
 			continue
 		}
-		if content == "exit" {
+		if content == "/exit" {
 			fmt.Println("【系统】退出聊天室")
 			return
+		}
+		// /rank 命令：发给服务端查询活跃度排名
+		if content == "/rank" {
+			if _, err := fmt.Fprintln(c.conn, "/rank"); err != nil {
+				fmt.Printf("【系统】发送失败，与服务端的连接可能已断开: %v\n", err)
+				return
+			}
+			continue
 		}
 		// 打包信息；from 由服务端按登录昵称重填，这里填的只是报文占位
 		if _, err := fmt.Fprintln(c.conn, utils.MsgUser(content, c.name)); err != nil {

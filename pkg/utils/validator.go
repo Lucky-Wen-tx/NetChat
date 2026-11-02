@@ -8,23 +8,19 @@ import (
 )
 
 const (
-	// MinNameLen / MaxNameLen 昵称长度限制，单位是「字符数」而不是字节数。
-	// 按字节数算的话，一个有 20 个字的中文昵称（60 字节）会被误判成超长。
+	// MinNameLen / MaxNameLen 昵称长度限制，按字符数算而非字节数——
+	// 否则一个 20 字中文昵称（60 字节）会被误判超长。
 	MinNameLen = 2
 	MaxNameLen = 20
 
 	// MinPasswordLen 密码最小长度（字符数）
 	MinPasswordLen = 6
 
-	// MaxPasswordBytes 密码最大长度（字节数）。
-	// 这是 bcrypt 的硬限制：超过 72 字节时 GenerateFromPassword 会直接报错。
-	// 按字节而不是字符算，中文密码约 24 个字就到上限。
+	// MaxPasswordBytes 密码最大长度（字节数）。bcrypt 硬限制：超过 72 字节会直接报错。
 	MaxPasswordBytes = 72
 )
 
-// VerifyPassword 校验密码格式合法性。
-//
-// 客户端和服务端都要调用：客户端只是为了提前提示，
+// VerifyPassword 校验密码格式。客户端和服务端都要调用：客户端只为了提前提示，
 // 服务端调用才是安全边界，裸 socket 可以完全绕过客户端校验。
 func VerifyPassword(password string) error {
 	if n := utf8.RuneCountInString(password); n < MinPasswordLen {
@@ -39,9 +35,7 @@ func VerifyPassword(password string) error {
 	return nil
 }
 
-// VerifyName 校验昵称格式合法性。
-//
-// 服务端必须独立调用一次：客户端那侧的校验只是为了提前提示，
+// VerifyName 校验昵称格式。服务端必须独立调用一次：客户端那侧的校验只是为了提前提示，
 // 用裸 socket 连上来可以完全绕过它。
 func VerifyName(name string) error {
 	if n := utf8.RuneCountInString(name); n < MinNameLen || n > MaxNameLen {
@@ -53,11 +47,8 @@ func VerifyName(name string) error {
 	return nil
 }
 
-// checkPrintable 拒绝空白字符与控制字符。
-//
-// 昵称和聊天内容都会被原样打印进服务端日志、以及其他用户的终端，
-// 因此空白字符（会把昵称拆成两段）和控制字符（如 ANSI 转义 \x1b[2J 能清屏、
-// 甚至伪造出以假乱真的输出）都要挡在入口。
+// checkPrintable 拒绝空白字符和控制字符。昵称和聊天内容都会被原样打印进服务端日志
+// 和其他用户终端，空白字符会把昵称拆成两段，控制字符能伪造输出（如 ANSI 转义清屏）。
 func checkPrintable(s string) error {
 	if strings.ContainsFunc(s, unicode.IsControl) {
 		return fmt.Errorf("不能包含控制字符")

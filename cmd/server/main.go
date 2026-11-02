@@ -15,10 +15,8 @@ import (
 	"netChat/internal/store"
 )
 
-// defaultChatName 聊天室默认名称。
-// 这是默认值的【唯一来源】：docker-compose.yml 只负责透传 CHAT_NAME 环境变量，
-// 不写默认值。这样以后改默认名字只需改这一行，compose 文件不用动，
-// 也就不会产生配置漂移、导致容器被意外重建。
+// defaultChatName 聊天室默认名称。这是默认值的唯一来源：
+// docker-compose.yml 只透传 CHAT_NAME 环境变量，不写默认值，改默认名只需改这一行。
 const defaultChatName = "摸鱼小组"
 
 // listenAddr 服务端监听地址
@@ -32,8 +30,7 @@ func main() {
 		chatName = defaultChatName
 	}
 
-	// 初始化 MySQL。必须放在 net.Listen 之前：数据库不可用时应直接失败退出，
-	// 而不是让服务端看起来启动成功、实际每次登录都报错。
+	// 初始化 MySQL。必须放在 net.Listen 之前：数据库不可用时应直接失败退出。
 	// DSN 只从环境变量读取，代码里不保留任何默认密码。
 	dsn := strings.TrimSpace(os.Getenv("MYSQL_DSN"))
 	if dsn == "" {
@@ -58,13 +55,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 初始化 Redis：活跃度排名、异步消息队列、用户哈希缓存
+	redisAddr := strings.TrimSpace(os.Getenv("REDIS_ADDR"))
+	if redisAddr == "" {
+		fmt.Println("缺少环境变量 REDIS_ADDR，例如：redis:6379")
+		os.Exit(1)
+	}
+	redisCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	redisStore, err := store.OpenRedis(redisCtx, redisAddr)
+	cancel()
+	if err != nil {
+		fmt.Printf("初始化 Redis 失败：%v\n", err)
+		os.Exit(1)
+	}
+	defer redisStore.Close()
+
 	// 初始化服务端实例对象
-	chatServer := server.NewChatServer(chatName, st)
+	chatServer := server.NewChatServer(chatName, st, redisStore)
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		// 必须在这里退出：listener 是 nil，继续往下走到 Close/Accept 会直接 panic，
-		// 真正的失败原因反而被 panic 栈埋掉
+	// 必须在这里退出：listener 是 nil，继续往下走到 Close/Accept 会直接 panic，
+	// 真正的失败原因反而被 panic 栈埋掉
 		fmt.Printf("监听 %s 失败：%v\n", listenAddr, err)
 		os.Exit(1)
 	}

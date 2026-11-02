@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -9,15 +10,12 @@ import (
 	"time"
 
 	"netChat/internal/model"
+	"netChat/internal/store"
 	"netChat/pkg/utils"
 )
 
-// sendBufferSize 单个客户端待发送队列的长度。
-//
-// 它只用来削峰和识别失联：一旦写满就判定该客户端已经不读数据了（见 enqueue）。
-// 取 64 是个折中——太小的话，客户端稍有一次卡顿（一次 GC、一次网络抖动）
-// 就会被误踢；太大的话，一个慢客户端能占的内存又太多。
-// 真正做到"判活"的是写失败和 TCP 保活，队列长度只是第一道快速反应。
+// sendBufferSize 单个客户端待发送队列长度。写满即判定失联（见 enqueue）。
+// 取 64 是折中：太小容易被网络抖动误踢，太大则慢客户端占内存太多。
 const sendBufferSize = 64
 
 // ClientConn 服务端客户端连接运行时对象
@@ -27,10 +25,8 @@ type ClientConn struct {
 	send   chan string
 	server *ChatServer
 
-	// reader 是这条连接唯一的行读取器：昵称和后续消息都从它读。
-	// 必须从头用到尾，不能读完昵称再新建一个——
-	// bufio.Scanner 会预读最多 4096 字节，换掉 Scanner 就等于把
-	// 已经预读进内存、但还没消费的数据（很可能是客户端发的第一条消息）一起丢掉。
+	// reader 是这条连接唯一的行读取器，昵称和后续消息都从它读。
+	// bufio.Scanner 会预读最多 4096 字节，换掉 Scanner 会丢掉已预读的数据。
 	reader *bufio.Scanner
 
 	// closeOnce 保证 cleanup 只执行一次
@@ -52,11 +48,9 @@ func newClientConn(conn net.Conn, reader *bufio.Scanner, name string, server *Ch
 	}
 }
 
-// enqueue 非阻塞地投递一条待发送消息。
-//
-// 队列写满说明这个客户端已经长时间不读数据（卡死、断电或故意为之）。
-// 这里绝不能阻塞：广播是持有服务端读锁进行的，一旦卡住，
-// 其他人的广播、新用户的登录会全部一起卡死——一个客户端就能拖垮整个服务端。
+// enqueue 非阻塞投递一条待发送消息。
+// 队列写满说明客户端已长时间不读数据（卡死、断电或故意为之）。
+// 这里绝不能阻塞：广播持读锁进行，一旦卡住整个服务端跟着卡死。
 // 所以直接断开它，剩下的交给 readLoop 的统一清理流程。
 func (c *ClientConn) enqueue(msg string) {
 	select {
@@ -79,13 +73,20 @@ func (c *ClientConn) writeLoop() {
 	}
 }
 
-// readLoop 专属读协程：读取客户端消息并触发广播
+// readLoop 读取客户端消息，投递到 Redis 异步队列并记活跃度。
 func (c *ClientConn) readLoop() {
 	defer c.cleanup()
 
 	for c.reader.Scan() {
 		line := c.reader.Text()
-		if strings.TrimSpace(line) == "" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		// /rank 命令：查询活跃度排名，单独回复请求者
+		if trimmed == "/rank" {
+			c.server.handleRank(c)
 			continue
 		}
 
@@ -99,7 +100,18 @@ func (c *ClientConn) readLoop() {
 		}
 		fmt.Printf("收到用户[%s]消息：%s\n", c.User.Name, in.Content)
 
-		c.server.broadcast(utils.MsgUser(in.Content, c.User.Name), c.User.Name)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		msg := utils.MsgUser(in.Content, c.User.Name)
+		if err := c.server.redisStore.PushMessage(ctx, store.QueueItem{
+			Payload: msg,
+			Except:  c.User.Name,
+		}); err != nil {
+			fmt.Printf("用户[%s] 消息入队失败：%v\n", c.User.Name, err)
+		}
+		if err := c.server.redisStore.IncrActivity(ctx, c.User.Name); err != nil {
+			fmt.Printf("用户[%s] 活跃度记录失败：%v\n", c.User.Name, err)
+		}
+		cancel()
 	}
 
 	if err := c.reader.Err(); err != nil {
@@ -110,10 +122,9 @@ func (c *ClientConn) readLoop() {
 // cleanup 连接结束时的统一收尾，只会真正执行一次
 func (c *ClientConn) cleanup() {
 	c.closeOnce.Do(func() {
-		// 顺序不能反。removeClient 要拿写锁，而广播拿的是读锁，两者互斥：
-		// 它一旦返回，就不可能还有广播正拿着从 clients 里取到的这个 c 去写 c.send。
-		// 此时关闭通道才安全；反过来先关通道，就有概率
-		// panic: send on closed channel，直接把整个服务端进程带走。
+		// 顺序不能反。removeClient 持写锁，广播持读锁，互斥；
+		// 它一旦返回，就不可能还有广播正持有这个 c 去写 c.send。
+		// 此时关通道才安全；反过来先关通道就有概率 panic: send on closed channel。
 		c.server.removeClient(c)
 		close(c.send) // 通知 writeLoop 退出
 		c.Conn.Close()
